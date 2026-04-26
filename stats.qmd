@@ -1,0 +1,19 @@
+---
+title: "Investigating the Association between Census Demographics and Hosting Capactiy"
+---
+
+```{r}
+library(here)
+library(tidyverse)
+```
+```{r}
+census <- read_csv(here("~/../../capstone/electrigrid/data/socioeconomic-census/census_data.csv"))
+# census2 <- read_csv(here("~/../../capstone/electrigrid/data/census-pop-data/pop_census_tidy.csv"))
+census_vars <- read_csv(here("~/../../capstone/electrigrid/data/census-pop-data/var20.csv"))
+```
+
+```{r}
+census_race <- census |> 
+    select(geoid, name, starts_with('estimate_total_sex_by_age')) |> 
+    pivot_longer(cols = starts_with('estimate_total_sex_by_age'), names_prefix = 'estimate_total_sex_by_age_', names_to = 'race', values_to = 'estimate')
+```
