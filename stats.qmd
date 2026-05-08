@@ -2,18 +2,109 @@
 title: "Investigating the Association between Census Demographics and Hosting Capactiy"
 ---
 
+# Load libraries & data
 ```{r}
-library(here)
 library(tidyverse)
+library(sfarrow)
+library(tidycensus)
+library(sf)
 ```
 ```{r}
-census <- read_csv(here("~/../../capstone/electrigrid/data/socioeconomic-census/census_data.csv"))
-# census2 <- read_csv(here("~/../../capstone/electrigrid/data/census-pop-data/pop_census_tidy.csv"))
-census_vars <- read_csv(here("~/../../capstone/electrigrid/data/census-pop-data/var20.csv"))
+census <- read_csv('census_final_tidy.csv') |> 
+  janitor::clean_names() |> 
+  select(-geometry)
+
+sce_census_map <- sfarrow::st_read_parquet("~/../../capstone/electrigrid/data/census_hosting_capacity/sce_census_map_new.parquet") |> 
+    janitor::clean_names() |> 
+    select(geoid, zillow_tract_hh_count, starts_with('avg_der'), geometry)
+
+pge_census_map <- sfarrow::st_read_parquet("~/../../capstone/electrigrid/data/census_hosting_capacity/pge_census_map_new.parquet") |> 
+    janitor::clean_names() |> 
+    select(geoid, zillow_tract_hh_count, starts_with('avg_der'), geometry)
+
+sdge_census_map <- sfarrow::st_read_parquet("~/../../capstone/electrigrid/data/census_hosting_capacity/sdge_census_map_new.parquet")
+```
+
+# Clean data
+
+Here we cap hosting capacity values to a max of 50kW per household due to major outliers in hosting capacity calculations
+```{r}
+sce_capped  <- sce_census_map |> 
+  mutate(
+    across(starts_with('avg_der'), ~pmin(.x, 50)), 
+    utility = 'SCE')
+
+pge_capped <- pge_census_map |> 
+  mutate(
+    across(starts_with('avg_der'), ~pmin(.x, 50)),
+    utility = "PG&E"
+  )
+
+sdge_capped <- sdge_census_map |> 
+  mutate(
+    across(starts_with('avg_der'), ~pmin(.x, 50)),
+    utility = "SDG&E"
+  )
 ```
 
 ```{r}
-census_race <- census |> 
-    select(geoid, name, starts_with('estimate_total_sex_by_age')) |> 
-    pivot_longer(cols = starts_with('estimate_total_sex_by_age'), names_prefix = 'estimate_total_sex_by_age_', names_to = 'race', values_to = 'estimate')
+# combine all utilities
+all_census_map <- bind_rows(sce_capped, pge_capped, sdge_capped) |> 
+    # set minimum zillow count
+    mutate(zillow_tract_hh_count = pmax(zillow_tract_hh_count, 1))
+```
+
+```{r}
+# iou service areas overlap, must handle duplicate tracts
+overlap_tracts <- all_census_map |> # 1619 overlapped tracts
+  group_by(geoid) |> 
+  filter(n() > 1) |> 
+  pull(geoid) |> unique()
+
+overlap_rows <- all_census_map |> 
+  filter(geoid %in% overlap_tracts) |> arrange(geoid)
+
+# fix overlapped tracts with weighted mean
+all_census_map <- all_census_map |>
+  group_by(geoid) |>
+  summarise(
+    avg_der_remain_pv_hh  = weighted.mean(avg_der_remain_pv_hh,  w = zillow_tract_hh_count),
+    avg_der_total_pv_hh  = weighted.mean(avg_der_total_pv_hh,  w = zillow_tract_hh_count),
+    avg_der_total_pv_opflex_hh = weighted.mean(avg_der_total_pv_opflex_hh, w = zillow_tract_hh_count),
+    avg_der_remain_load_hh = weighted.mean(avg_der_remain_load_hh, w = zillow_tract_hh_count),
+    zillow_tract_hh_count  = sum(zillow_tract_hh_count),
+    .groups = "drop"
+  )
+```
+
+# Prepare data for statistics
+
+```{r}
+joined <- left_join(all_census_map, census, by = 'geoid')
+
+joined_cleandem <- joined |> 
+    filter(str_starts(variable, "B01003_") | str_starts(variable, "B02001")) |> 
+    mutate(demographic = case_when(
+        str_detect(label, "White") ~ "White",
+        str_detect(label, "Black") ~ "Black",
+        str_detect(label, "Total:!!Hispanic") ~ "Hispanic/Latino",
+        str_detect(label, "Indian") ~ "American Indian/Alaska Native",
+        str_detect(label, "Asian") ~ "Asian",
+        str_detect(label, "Hawaiian") ~ "Native Hawaiian/Pacific Islander",
+        str_detect(label, "Other Race") ~ "Other Race",
+        str_detect(label, "Two or More") ~ "2+ Races",
+        str_detect(label, "Total:!!Not") ~ "Not Hispanic/Latino",
+        str_detect(label, "Estimate!!Total") ~ "Total Pop"
+    )) |> 
+    relocate(demographic, .after = label)
+
+joined_wide <- joined_cleandem |>
+  sf::st_drop_geometry() |> 
+  pivot_wider(
+    id_cols = c(geoid, avg_der_remain_pv_hh, avg_der_remain_load_hh, name),
+    names_from = demographic,
+    values_from = estimate) |> 
+  janitor::clean_names() |> 
+  mutate(
+    diversity = 1 - (white*(white-1) + black*(black-1) + american_indian_alaska_native*(american_indian_alaska_native-1) + asian*(asian-1) + native_hawaiian_pacific_islander*(native_hawaiian_pacific_islander-1) + other_race*(other_race-1) + x2_races*(x2_races-1)) / (total_pop*(total_pop-1)))
 ```
