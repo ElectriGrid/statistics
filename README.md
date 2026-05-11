@@ -18,8 +18,6 @@ Hosting capacity types analyzed (following ICA definitions):
 ## Analyses
 
 
-## Data Sources
-
 
 ## References
 
