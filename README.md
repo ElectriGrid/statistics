@@ -15,10 +15,17 @@ Hosting capacity types analyzed (following ICA definitions):
 - **PV w/ OpFlex** – solar generation with reverse power flow restrictions
 - **Load** – new load capacity (EVs, heat pumps, etc.)
 
-## Analyses
+## Repository Structure
 
-
+**stats.qmd**: Contains preliminary statistical analyses (linear regression), with sociodemographic variables as predictors and hosting capacity as response. ACS data and census-tract-level hosting capacity is required to run this file.
 
 ## References
 
 Brockway, A. M., Conde, J., & Callaway, D. (2021). Inequitable access to distributed energy resources due to grid infrastructure limits in California. *Nature Energy*, 6, 892–903.
+
+## Contributors
+- [Sofia Sarak](https://github.com/sofiasarak)
+- [Sofia Rodas](https://github.com/sofiiir)
+- [Zach Loo](https://github.com/zachyyy700)
+
+The analysis is part of a larger capstone project for the [Master of Environmental Data Science program](https://bren.ucsb.edu/masters-programs/master-environmental-data-science) at the Bren School of Environmental Science & Management. More information on the project can be found on the [Bren website](https://bren.ucsb.edu/projects/power-lines-and-people-mapping-how-distribution-grid-constraints-shape-resilient-and).
