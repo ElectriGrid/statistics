@@ -8,78 +8,322 @@ library(tidyverse)
 library(sfarrow)
 library(tidycensus)
 library(sf)
+library(here)
+library(tidymodels)
 ```
+
 ```{r}
 census <- read_csv('census_final_tidy.csv') |> 
   janitor::clean_names() |> 
   select(-geometry)
 
-sce_census_map <- sfarrow::st_read_parquet("~/../../capstone/electrigrid/data/census_hosting_capacity/sce_census_map_new.parquet") |> 
+census_area <- st_read("~/../../capstone/electrigrid/data/census/census_tracts_2025/tl_2025_06_tract.shp") |> 
+  select(GEOID, ALAND) |> janitor::clean_names()
+
+dac <- st_read_parquet("~/../../capstone/electrigrid/data/dis_adv_comm/calenviroscreen.parquet") %>% 
+  mutate(tract = as.character(tract)) %>% 
+  mutate(tract = str_pad(tract, width = 11, side = "left", pad = "0"))
+
+dir <- here::here('~', '..', '..', 'capstone', 'electrigrid', 'data', 'census_hosting_capacity')
+
+sce_census_map <- sfarrow::st_read_parquet(here(dir, "sce_census_map_new.parquet")) |> 
     janitor::clean_names() |> 
     select(geoid, zillow_tract_hh_count, starts_with('avg_der'), geometry)
 
-pge_census_map <- sfarrow::st_read_parquet("~/../../capstone/electrigrid/data/census_hosting_capacity/pge_census_map_new.parquet") |> 
+pge_census_map <- sfarrow::st_read_parquet(here(dir, "pge_census_map_new.parquet")) |> 
     janitor::clean_names() |> 
     select(geoid, zillow_tract_hh_count, starts_with('avg_der'), geometry)
 
-sdge_census_map <- sfarrow::st_read_parquet("~/../../capstone/electrigrid/data/census_hosting_capacity/sdge_census_map_new.parquet")
+sdge_census_map <- sfarrow::st_read_parquet(here(dir, "sdge_census_map_new.parquet")) |> 
+    janitor::clean_names() |> 
+    select(geoid, zillow_tract_hh_count, starts_with('avg_der'), geometry)
 ```
 
 # Clean data
 
-Here we cap hosting capacity values to a max of 50kW per household due to major outliers in hosting capacity calculations
-```{r}
-sce_capped  <- sce_census_map |> 
-  mutate(
-    across(starts_with('avg_der'), ~pmin(.x, 50)), 
-    utility = 'SCE')
-
-pge_capped <- pge_census_map |> 
-  mutate(
-    across(starts_with('avg_der'), ~pmin(.x, 50)),
-    utility = "PG&E"
-  )
-
-sdge_capped <- sdge_census_map |> 
-  mutate(
-    across(starts_with('avg_der'), ~pmin(.x, 50)),
-    utility = "SDG&E"
-  )
-```
-
 ```{r}
 # combine all utilities
-all_census_map <- bind_rows(sce_capped, pge_capped, sdge_capped) |> 
+all_census_map <- bind_rows(sce_census_map, pge_census_map, sdge_census_map) |> 
     # set minimum zillow count
     mutate(zillow_tract_hh_count = pmax(zillow_tract_hh_count, 1))
 ```
 
 ```{r}
-# iou service areas overlap, must handle duplicate tracts
-overlap_tracts <- all_census_map |> # 1619 overlapped tracts
+# iou service areas overlap, must handle overlapped tracts
+overlap_tracts <- all_census_map |> # 1620 overlapped tracts
   group_by(geoid) |> 
   filter(n() > 1) |> 
   pull(geoid) |> unique()
 
-overlap_rows <- all_census_map |> 
-  filter(geoid %in% overlap_tracts) |> arrange(geoid)
+# overlap_rows <- all_census_map |> 
+#   filter(geoid %in% overlap_tracts) |> arrange(geoid)
 
 # fix overlapped tracts with weighted mean
 all_census_map <- all_census_map |>
   group_by(geoid) |>
   summarise(
-    avg_der_remain_pv_hh  = weighted.mean(avg_der_remain_pv_hh,  w = zillow_tract_hh_count),
-    avg_der_total_pv_hh  = weighted.mean(avg_der_total_pv_hh,  w = zillow_tract_hh_count),
-    avg_der_total_pv_opflex_hh = weighted.mean(avg_der_total_pv_opflex_hh, w = zillow_tract_hh_count),
-    avg_der_remain_load_hh = weighted.mean(avg_der_remain_load_hh, w = zillow_tract_hh_count),
-    zillow_tract_hh_count  = sum(zillow_tract_hh_count),
-    .groups = "drop"
-  )
+    across(starts_with("avg_der"), ~ weighted.mean(.x, w = zillow_tract_hh_count, na.rm = TRUE)),
+    zillow_tract_hh_count = sum(zillow_tract_hh_count)
+  ) |> ungroup()
 ```
+
+```{r}
+# need to handle outliers in combined zillow estimate
+all_census_map |>
+  arrange(desc(zillow_tract_hh_count)) |>
+  select(geoid, zillow_tract_hh_count) |>
+  st_drop_geometry() |> 
+  head(20)
+
+hist(log10(all_census_map$zillow_tract_hh_count))
+```
+
+The histogram shows our estimates are centered around 10^3 units, which, in the census data lines up with outliers above 10^4 should not be included.
+
+```{r}
+all_census_map_filtered <- all_census_map |> 
+  filter(zillow_tract_hh_count <= 10000)
+```
+
+# Random Forest Revised with only DAC data
+
+```{r}
+features <- c(
+  # Race/ethnicity (drop one to avoid perfect multicollinearity, drop White_Pct)
+  "Hispanic_Pct", "Black_Pct", "Asian_Pct", "NatAmeri_Pct", "OtherMulti_Pct",
+  
+  # Socioeconomic
+  "Poverty_Pctl", "HousingBurden_Pctl", "Education_Pctl", "CIscore_Pctl",
+  "Unemployment_Pctl", "LinguisticIso_Pctl", "housing_density_hh_km2",
+  
+  # DAC status (binary)
+  "is_dac"
+)
+```
+
+```{r}
+# prepare clean model data
+model_data <- all_census_map_filtered |> 
+  st_drop_geometry() |> 
+  left_join(dac |> st_drop_geometry(), by = join_by(geoid == tract)) |> 
+  mutate(
+    is_dac = as.integer(CIscore_Pctl >= 75),
+    diversity = 1 - ((White_Pct/100)^2 + (Hispanic_Pct/100)^2 + (Black_Pct/100)^2 + 
+                 (Asian_Pct/100)^2 + (NatAmeri_Pct/100)^2 + (OtherMulti_Pct/100)^2),
+    housing_density_hh_km2 = zillow_tract_hh_count / Shape_Area * 1e6
+  ) |>
+  select(geoid, starts_with('avg_der'), all_of(features), zillow_tract_hh_count) |> na.omit()
+```
+
+```{r}
+# 2. recipe
+rec <- recipe(avg_der_remain_pv_hh ~ ., data = model_data |> select(geoid, avg_der_remain_pv_hh, all_of(features), zillow_tract_hh_count)) |>
+  update_role(geoid, new_role = "ID") |>
+  update_role(zillow_tract_hh_count, new_role = "ID")  # used as weight, not predictor
+
+# 3. model spec — mtry to tune
+rf_spec <- rand_forest(mtry = tune(), trees = 500) |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("regression")
+
+# 4. workflow
+wf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(rf_spec)
+
+# 5. 10-fold CV + tune mtry
+cv <- vfold_cv(model_data, v = 10)
+tune_res <- tune_grid(
+  wf,
+  resamples = cv,
+  grid = tibble(mtry = c(2, 3, 11))  
+)
+
+# 6. fit final model with best mtry
+best <- select_best(tune_res, metric = "rmse")
+final_wf <- finalize_workflow(wf, best)
+final_fit <- fit(final_wf, model_data)
+
+# 7. results
+collect_metrics(tune_res)
+final_fit |> extract_fit_engine() |> vip::vip()
+```
+
+The resulting metrics & VIP show that this RF model has a low R-squared but still has meaningful feature importance, indicating that our features don't *predict* hosting capacity but are still *correlated*.
+
+```{r}
+# post model checks
+model_data |>
+  select(all_of(features)) |>
+  cor(use = "complete.obs") |>
+  as.data.frame() |>
+  rownames_to_column("var1") |>
+  pivot_longer(-var1, names_to = "var2", values_to = "cor") |>
+  filter(var1 < var2, abs(cor) > 0.5) |>
+  arrange(desc(abs(cor)))
+```
+
+As the data we used is from CalEnviroScreen and some variables are suspected to be composites of others, the above cell investigates our features for collinearity. Collinear variables will be dropped before running a linear regression. We found that `Education_Pctl` and `CIscore_Pctl` is correlated with `Hispanic_Pct`, `Poverty_Pctl`, and `LinguisticIso_Pctl`. `is_dac` will also be dropped as it does not show in our VIP.
+
+```{r}
+lm_features <- c(
+  "housing_density_hh_km2", "Hispanic_Pct", "Black_Pct", "Asian_Pct", "NatAmeri_Pct", 
+  "OtherMulti_Pct", "Poverty_Pctl", "HousingBurden_Pctl", "Unemployment_Pctl", "LinguisticIso_Pctl"
+)
+```
+
+```{r}
+# Linear Regression (scaled & weighted) 
+model_data_scaled <- model_data |> 
+  mutate(across(all_of(lm_features), scale))
+
+lm_fit <- lm(avg_der_remain_pv_hh ~ ., data = model_data_scaled |> select(avg_der_remain_pv_hh, all_of(lm_features)),
+weights = model_data_scaled$zillow_tract_hh_count)
+
+summary(lm_fit)
+```
+
+Before further investigation, we repeat this same process on another DER type.
+
+```{r}
+# 2. recipe
+rec <- recipe(avg_der_remain_load_hh ~ ., data = model_data |> select(geoid, avg_der_remain_load_hh, all_of(features), zillow_tract_hh_count)) |>
+  update_role(geoid, new_role = "ID") |>
+  update_role(zillow_tract_hh_count, new_role = "ID")  # used as weight, not predictor
+
+# 3. model spec — mtry to tune
+rf_spec <- rand_forest(mtry = tune(), trees = 500) |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("regression")
+
+# 4. workflow
+wf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(rf_spec)
+
+# 5. 10-fold CV + tune mtry
+cv <- vfold_cv(model_data, v = 10)
+tune_res <- tune_grid(
+  wf,
+  resamples = cv,
+  grid = tibble(mtry = c(2, 3, 11))  
+)
+
+# 6. fit final model with best mtry
+best <- select_best(tune_res, metric = "rmse")
+final_wf <- finalize_workflow(wf, best)
+final_fit <- fit(final_wf, model_data)
+
+# 7. results
+collect_metrics(tune_res)
+final_fit |> extract_fit_engine() |> vip::vip()
+
+lm_fit <- lm(avg_der_remain_load_hh ~ ., data = model_data_scaled |> select(avg_der_remain_load_hh, all_of(lm_features)),
+weights = model_data_scaled$zillow_tract_hh_count)
+
+summary(lm_fit)
+```
+
+Run our models again on remaining generation.
+
+```{r}
+# 2. recipe
+rec <- recipe(avg_der_remain_generation_hh ~ ., data = model_data |> select(geoid, avg_der_remain_generation_hh, all_of(features), zillow_tract_hh_count)) |>
+  update_role(geoid, new_role = "ID") |>
+  update_role(zillow_tract_hh_count, new_role = "ID")  # used as weight, not predictor
+
+# 3. model spec — mtry to tune
+rf_spec <- rand_forest(mtry = tune(), trees = 500) |>
+  set_engine("ranger", importance = "impurity") |>
+  set_mode("regression")
+
+# 4. workflow
+wf <- workflow() |>
+  add_recipe(rec) |>
+  add_model(rf_spec)
+
+# 5. 10-fold CV + tune mtry
+cv <- vfold_cv(model_data, v = 10)
+tune_res <- tune_grid(
+  wf,
+  resamples = cv,
+  grid = tibble(mtry = c(2, 3, 11))  
+)
+
+# 6. fit final model with best mtry
+best <- select_best(tune_res, metric = "rmse")
+final_wf <- finalize_workflow(wf, best)
+final_fit <- fit(final_wf, model_data)
+
+# 7. results
+collect_metrics(tune_res)
+final_fit |> extract_fit_engine() |> vip::vip()
+
+lm_fit <- lm(avg_der_remain_generation_hh ~ ., data = model_data_scaled |> select(avg_der_remain_generation_hh, all_of(lm_features)),
+weights = model_data_scaled$zillow_tract_hh_count)
+
+summary(lm_fit)
+```
+
+-------------- everything below is for previous iterations of a potential stats workflow, keeping it for now --------
 
 # Prepare data for statistics
 
 ```{r}
+# calenviroscreen join
+der_cal <- left_join(all_census_map, dac %>% st_drop_geometry(), by = join_by(geoid == tract))
+```
+
+```{r}
+der_cal |>
+  select(geoid, avg_der_remain_pv_hh, White_Pct, Hispanic_Pct, Black_Pct, Asian_Pct) |>
+  pivot_longer(cols = ends_with('_Pct'), names_to = 'race', values_to = 'race_pct') |>
+  ggplot(aes(x = race_pct, y = avg_der_remain_pv_hh, color = race)) +
+  geom_smooth(method = 'loess', se = TRUE) +
+  facet_wrap(~race) +
+  labs(x = 'Race/ethnicity (%)', y = 'Avg remaining PV hosting capacity (kW/HH)')
+```
+
+```{r}
+der_cols <- der_cal |> st_drop_geometry() |> select(starts_with('avg_der')) |> names()
+
+plots <- map(der_cols, \(der_type) {
+  der_cal |>
+    select(geoid, all_of(der_type), White_Pct, Hispanic_Pct, Black_Pct, Asian_Pct) |>
+    pivot_longer(cols = ends_with('_Pct'), names_to = 'race', values_to = 'race_pct') |>
+    mutate(race = str_remove(race, '_Pct')) |>
+    ggplot(aes(x = race_pct, y = .data[[der_type]], color = race)) +
+    geom_smooth(method = 'loess', se = TRUE) +
+    guides(color = 'none') +
+    facet_wrap(~race) +
+    labs(x = 'Race/ethnicity (%)', y = der_type, title = der_type)
+})
+
+walk(plots, print)
+```
+
+```{r}
+model <- lm(avg_der_total_pv_hh ~ White_Pct + Hispanic_Pct + Asian_Pct + Black_Pct, data = der_cal)
+summary(model)
+```
+
+```{r}
+der_long <- der_cal %>% 
+  select(geoid, starts_with('avg_der'), 'White_Pct', 'Hispanic_Pct', 'Black_Pct', 'Asian_Pct') %>% 
+  pivot_longer(cols=starts_with('avg_der'), names_to = 'der_type', values_to = 'hosting_cap') %>% 
+  pivot_longer(cols=ends_with('Pct'), names_to = 'race', values_to = 'race_pct')
+```
+
+```{r}
+ggplot(der_long %>% filter(hosting_cap >= 0), aes(x = race_pct, y = hosting_cap, color = race)) +
+  geom_point() +
+  facet_wrap(~der_type)
+```
+
+
+
+```{r}
+# acs join
 joined <- left_join(all_census_map, census, by = 'geoid')
 
 joined_cleandem <- joined |> 
@@ -101,10 +345,26 @@ joined_cleandem <- joined |>
 joined_wide <- joined_cleandem |>
   sf::st_drop_geometry() |> 
   pivot_wider(
-    id_cols = c(geoid, avg_der_remain_pv_hh, avg_der_remain_load_hh, name),
+    id_cols = c(geoid, starts_with('avg_der'), name),
     names_from = demographic,
     values_from = estimate) |> 
   janitor::clean_names() |> 
   mutate(
     diversity = 1 - (white*(white-1) + black*(black-1) + american_indian_alaska_native*(american_indian_alaska_native-1) + asian*(asian-1) + native_hawaiian_pacific_islander*(native_hawaiian_pacific_islander-1) + other_race*(other_race-1) + x2_races*(x2_races-1)) / (total_pop*(total_pop-1)))
+
+percents <- joined_wide |> 
+  mutate(
+    white_pct = white / total_pop, 
+    black_pct = black / total_pop, 
+    native_indian_pct = american_indian_alaska_native / total_pop, 
+    asian_pct = asian / total_pop,
+    native_pacific_pct = native_hawaiian_pacific_islander / total_pop,
+    other_pct = other_race / total_pop,
+    x2_races_pct = x2_races / total_pop) |> 
+      select(geoid, name, starts_with('avg_der'), ends_with('_pct'), diversity)
+```
+
+```{r}
+model <- lm(avg_der_remain_pv_hh ~ white_pct + black_pct + asian_pct + x2_races_pct + diversity, data = percents)
+summary(model)
 ```
