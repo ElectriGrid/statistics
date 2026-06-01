@@ -1,0 +1,118 @@
+---
+title: "Final Visualizations and Analysis"
+author: "ElectriGrid"
+format: html
+---
+
+The following notebook contains code to create visualizations for:
+
+1.  Equality ratios (bar plot)
+
+2.  Boxplots comparing electric grid variables for disadvantaged and non-disadvantaged communities
+
+Adaptions of these visualizations were used in the final public presentation for ElectriGrid, and also provide an exploration of relationships between sociodemographic variables and the electrid grid in California. 
+
+```{r}
+#| message: false 
+# import necessary libraries
+library(tidyverse)
+library(patchwork)
+```
+
+## Equity Ratios
+
+```{r}
+#| message: false
+# import data
+ratios_raw <- read_csv("ratios.csv")
+```
+
+```{r}
+head(ratios_raw)
+```
+
+```{r}
+# keep specific ratios of interest (remaining capacity)
+ratios <- ratios_raw %>% 
+  select(group, avg_DER_remain_generation_hh, avg_DER_remain_load_hh, avg_DER_remain_pv_hh) %>% 
+  pivot_longer(cols = c(avg_DER_remain_generation_hh,avg_DER_remain_pv_hh), names_to = "variable", values_to = "ratio")
+```
+
+```{r}
+# save colors
+blue <- "#bfd8e9"
+solar <- "#E6C75E"
+gen <- "#A8CB92"
+```
+
+```{r}
+# plot
+ggplot(ratios, aes(x = group, y = ratio, fill = variable)) +
+  geom_bar(stat = "identity", position = "dodge",
+           color = "white") +
+  geom_hline(yintercept = 1, linetype = "dashed", linewidth = 1.5,
+             color = blue) +
+  scale_fill_manual(values = c(gen, solar), 
+                    labels = c("Total", "Solar")) +
+  scale_x_discrete(labels = c("Asian_Pct" = "Asian", "Black_Pct" = "Black",
+                              "Hispanic_Pct" = "Hispanic", "NatAmeri_Pct" = "Native American",
+                              "OtherMulti_Pct" = "Other/Multi", "White_Pct" = "White")) +
+  labs(fill = " ",
+       y = "Equity Ratio", x = "Racial/Ethnic Group") +
+  theme_minimal()
+
+# ggsave("ratios_plot.png", height = 4, width = 8)
+```
+
+**Conclusion:** Hispanic communities appear to be under-represented in both total and solar hosting capacity in California.
+
+## Distribution Boxplots
+
+```{r}
+#| message: false
+df <- read_csv("dis_hosting_075.csv")
+```
+
+Creating 6 boxplots: one for each generation capacity variable that we calculated.
+
+```{r}
+# save variable names to iterate over
+cols = c('avg_DER_remain_pv_opflex_hh', 'avg_DER_remain_generation_hh', 'avg_DER_remain_generation_opflex_hh', 'avg_DER_total_generation_hh', 'avg_DER_remain_load_hh', 'avg_DER_total_pv_hh')
+
+
+# create a boxplot for each capacity variable, comparing the different DAC statuses
+
+for (i in 1:length(cols)){ # iterate over each variable name in df
+
+
+assign(paste0("plot_", cols[i]), # assign plot name based on generation variable
+       
+       # create basic boxplot
+       ggplot(df, aes(y = as.factor(DAC_status), .data[[cols[i]]])) +
+       geom_boxplot(outliers = FALSE) +
+       labs(y = "DAC Status")
+       + theme_light()) 
+
+}
+```
+
+Assembling the 6 plots into one figure to view.
+
+```{r}
+#| warning: false
+# using patchwork, assemble 6 plots into 1
+p <- plot_avg_DER_remain_pv_opflex_hh + plot_avg_DER_remain_generation_hh +
+plot_avg_DER_remain_generation_opflex_hh + plot_avg_DER_total_generation_hh + plot_avg_DER_remain_load_hh + plot_avg_DER_total_pv_hh +
+  
+  # add title
+  plot_annotation(title = "Comparing distribution of electric grid variables (kW) between disadvantaged and\nnon-disadvantaged communities",
+    subtitle = "Where DAC Status = 1 refers to CI Score being in the 75th percentile")
+
+# save figure
+ggsave("boxplots.png", plot = p, width = 9.5, height = 6, unit = "in")
+
+# view
+p
+```
+
+**Conclusion**: Disadvanataged communities have a lower median total hosting capacity but more capacity to host solar.
